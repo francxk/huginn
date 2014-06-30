@@ -6,10 +6,17 @@ describe Agents::EventFormattingAgent do
         :name => "somename",
         :options => {
             :instructions => {
-                :message => "Received <$.content.text.*> from <$.content.name> .",
-                :subject => "Weather looks like <$.conditions>"
+                :message => "Received {{content.text}} from {{content.name}} .",
+                :subject => "Weather looks like {{conditions}} according to the forecast at {{pretty_date.time}}"
             },
             :mode => "clean",
+            :matchers => [
+                {
+                    :path => "{{date.pretty}}",
+                    :regexp => "\\A(?<time>\\d\\d:\\d\\d [AP]M [A-Z]+)",
+                    :to => "pretty_date",
+                },
+            ],
             :skip_agent => "false",
             :skip_created_at => "false"
         }
@@ -24,7 +31,11 @@ describe Agents::EventFormattingAgent do
     @event.payload = {
         :content => {
             :text => "Some Lorem Ipsum",
-            :name => "somevalue"
+            :name => "somevalue",
+        },
+        :date => {
+            :epoch => "1357959600",
+            :pretty => "10:00 PM EST on January 11, 2013"
         },
         :conditions => "someothervalue"
     }
@@ -61,13 +72,17 @@ describe Agents::EventFormattingAgent do
     it "should handle JSONPaths in instructions" do
       @checker.receive([@event])
       Event.last.payload[:message].should == "Received Some Lorem Ipsum from somevalue ."
-      Event.last.payload[:subject].should == "Weather looks like someothervalue"
+    end
+
+    it "should handle matchers and JSONPaths in instructions" do
+      @checker.receive([@event])
+      Event.last.payload[:subject].should == "Weather looks like someothervalue according to the forecast at 10:00 PM EST"
     end
 
     it "should allow escaping" do
       @event.payload[:content][:name] = "escape this!?"
       @event.save!
-      @checker.options[:instructions][:message] = "Escaped: <escape $.content.name>\nNot escaped: <$.content.name>"
+      @checker.options[:instructions][:message] = "Escaped: {{content.name | uri_escape}}\nNot escaped: {{content.name}}"
       @checker.save!
       @checker.receive([@event])
       Event.last.payload[:message].should == "Escaped: escape+this%21%3F\nNot escaped: escape this!?"
@@ -108,6 +123,28 @@ describe Agents::EventFormattingAgent do
     it "should validate presence of instructions" do
       @checker.options[:instructions] = ""
       @checker.should_not be_valid
+    end
+
+    it "should validate type of matchers" do
+      @checker.options[:matchers] = ""
+      @checker.should_not be_valid
+      @checker.options[:matchers] = {}
+      @checker.should_not be_valid
+    end
+
+    it "should validate the contents of matchers" do
+      @checker.options[:matchers] = [
+        {}
+      ]
+      @checker.should_not be_valid
+      @checker.options[:matchers] = [
+        { :regexp => "(not closed", :path => "text" }
+      ]
+      @checker.should_not be_valid
+      @checker.options[:matchers] = [
+        { :regexp => "(closed)", :path => "text", :to => "foo" }
+      ]
+      @checker.should be_valid
     end
 
     it "should validate presence of mode" do

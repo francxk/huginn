@@ -9,7 +9,7 @@ describe Agents::TwitterPublishAgent do
       :consumer_secret => "---",
       :oauth_token => "---",
       :oauth_token_secret => "---",
-      :message_path => "text"
+      :message => "{{text}}"
     }
 
     @checker = Agents::TwitterPublishAgent.new(:name => "HuginnBot", :options => @opts)
@@ -22,7 +22,10 @@ describe Agents::TwitterPublishAgent do
     @event.save!
 
     @sent_messages = []
-    stub.any_instance_of(Agents::TwitterPublishAgent).publish_tweet { |message| @sent_messages << message}
+    stub.any_instance_of(Agents::TwitterPublishAgent).publish_tweet { |message|
+      @sent_messages << message
+      OpenStruct.new(:id => 454209588376502272)
+    }
   end
 
   describe '#receive' do

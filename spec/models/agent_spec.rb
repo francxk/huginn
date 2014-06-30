@@ -1,6 +1,25 @@
 require 'spec_helper'
 
 describe Agent do
+  it_behaves_like WorkingHelpers
+
+  describe ".bulk_check" do
+    before do
+      @weather_agent_count = Agents::WeatherAgent.where(:schedule => "midnight", :disabled => false).count
+    end
+
+    it "should run all Agents with the given schedule" do
+      mock(Agents::WeatherAgent).async_check(anything).times(@weather_agent_count)
+      Agents::WeatherAgent.bulk_check("midnight")
+    end
+
+    it "should skip disabled Agents" do
+      agents(:bob_weather_agent).update_attribute :disabled, true
+      mock(Agents::WeatherAgent).async_check(anything).times(@weather_agent_count - 1)
+      Agents::WeatherAgent.bulk_check("midnight")
+    end
+  end
+
   describe ".run_schedule" do
     before do
       Agents::WeatherAgent.count.should > 0
@@ -102,6 +121,17 @@ describe Agent do
       stub(Agents::CannotBeScheduled).valid_type?("Agents::CannotBeScheduled") { true }
     end
 
+    describe Agents::SomethingSource do
+      let(:new_instance) do
+        agent = Agents::SomethingSource.new(:name => "some agent")
+        agent.user = users(:bob)
+        agent
+      end
+
+      it_behaves_like LiquidInterpolatable
+      it_behaves_like HasGuid
+    end
+
     describe ".default_schedule" do
       it "stores the default on the class" do
         Agents::SomethingSource.default_schedule.should == "2pm"
@@ -191,17 +221,31 @@ describe Agent do
         log.message.should =~ /Exception/
         log.level.should == 4
       end
+
+      it "should not run disabled Agents" do
+        mock(Agent).find(agents(:bob_weather_agent).id) { agents(:bob_weather_agent) }
+        do_not_allow(agents(:bob_weather_agent)).check
+        agents(:bob_weather_agent).update_attribute :disabled, true
+        Agent.async_check(agents(:bob_weather_agent).id)
+      end
     end
 
-    describe ".receive! and .async_receive" do
+    describe ".receive!" do
       before do
         stub_request(:any, /wunderground/).to_return(:body => File.read(Rails.root.join("spec/data_fixtures/weather.json")), :status => 200)
         stub.any_instance_of(Agents::WeatherAgent).is_tomorrow?(anything) { true }
       end
 
       it "should use available events" do
-        mock.any_instance_of(Agents::TriggerAgent).receive(anything).once
         Agent.async_check(agents(:bob_weather_agent).id)
+        mock(Agent).async_receive(agents(:bob_rain_notifier_agent).id, anything).times(1)
+        Agent.receive!
+      end
+
+      it "should not propogate to disabled Agents" do
+        Agent.async_check(agents(:bob_weather_agent).id)
+        agents(:bob_rain_notifier_agent).update_attribute :disabled, true
+        mock(Agent).async_receive(agents(:bob_rain_notifier_agent).id, anything).times(0)
         Agent.receive!
       end
 
@@ -275,6 +319,15 @@ describe Agent do
         lambda {
           Agent.receive! # and we receive it
         }.should change { agents(:bob_rain_notifier_agent).reload.last_checked_event_id }
+      end
+    end
+
+    describe ".async_receive" do
+      it "should not run disabled Agents" do
+        mock(Agent).find(agents(:bob_rain_notifier_agent).id) { agents(:bob_rain_notifier_agent) }
+        do_not_allow(agents(:bob_rain_notifier_agent)).receive
+        agents(:bob_rain_notifier_agent).update_attribute :disabled, true
+        Agent.async_receive(agents(:bob_rain_notifier_agent).id, [1, 2, 3])
       end
     end
 
@@ -437,6 +490,23 @@ describe Agent do
         agent.should have(0).errors_on(:sources)
       end
 
+      it "should not allow scenarios owned by other people" do
+        agent = Agents::SomethingSource.new(:name => "something")
+        agent.user = users(:bob)
+
+        agent.scenario_ids = [scenarios(:bob_weather).id]
+        agent.should have(0).errors_on(:scenarios)
+
+        agent.scenario_ids = [scenarios(:bob_weather).id, scenarios(:jane_weather).id]
+        agent.should have(1).errors_on(:scenarios)
+
+        agent.scenario_ids = [scenarios(:jane_weather).id]
+        agent.should have(1).errors_on(:scenarios)
+
+        agent.user = users(:jane)
+        agent.should have(0).errors_on(:scenarios)
+      end
+
       it "validates keep_events_for" do
         agent = Agents::SomethingSource.new(:name => "something")
         agent.user = users(:bob)
@@ -515,31 +585,98 @@ describe Agent do
       end
     end
 
+    describe "Agent.build_clone" do
+      before do
+        Event.delete_all
+        @sender = Agents::SomethingSource.new(
+          name: 'Agent (2)',
+          options: { foo: 'bar2' },
+          schedule: '5pm')
+        @sender.user = users(:bob)
+        @sender.save!
+        @sender.create_event :payload => {}
+        @sender.create_event :payload => {}
+        @sender.events.count.should == 2
+
+        @receiver = Agents::CannotBeScheduled.new(
+          name: 'Agent',
+          options: { foo: 'bar3' },
+          keep_events_for: 3,
+          propagate_immediately: true)
+        @receiver.user = users(:bob)
+        @receiver.sources << @sender
+        @receiver.memory[:test] = 1
+        @receiver.save!
+      end
+
+      it "should create a clone of a given agent for editing" do
+        sender_clone = users(:bob).agents.build_clone(@sender)
+
+        sender_clone.attributes.should == Agent.new.attributes.
+          update(@sender.slice(:user_id, :type,
+            :options, :schedule, :keep_events_for, :propagate_immediately)).
+          update('name' => 'Agent (2) (2)', 'options' => { 'foo' => 'bar2' })
+
+        sender_clone.source_ids.should == []
+
+        receiver_clone = users(:bob).agents.build_clone(@receiver)
+
+        receiver_clone.attributes.should == Agent.new.attributes.
+          update(@receiver.slice(:user_id, :type,
+            :options, :schedule, :keep_events_for, :propagate_immediately)).
+          update('name' => 'Agent (3)', 'options' => { 'foo' => 'bar3' })
+
+        receiver_clone.source_ids.should == [@sender.id]
+      end
+    end
   end
 
-  describe "recent_error_logs?" do
-    it "returns true if last_error_log_at is near last_event_at" do
-      agent = Agent.new
+  describe ".trigger_web_request" do
+    class Agents::WebRequestReceiver < Agent
+      cannot_be_scheduled!
+    end
 
-      agent.last_error_log_at = 10.minutes.ago
-      agent.last_event_at = 10.minutes.ago
-      agent.recent_error_logs?.should be_true
+    before do
+      stub(Agents::WebRequestReceiver).valid_type?("Agents::WebRequestReceiver") { true }
+    end
 
-      agent.last_error_log_at = 11.minutes.ago
-      agent.last_event_at = 10.minutes.ago
-      agent.recent_error_logs?.should be_true
+    context "when .receive_web_request is defined" do
+      before do
+        @agent = Agents::WebRequestReceiver.new(:name => "something")
+        @agent.user = users(:bob)
+        @agent.save!
 
-      agent.last_error_log_at = 5.minutes.ago
-      agent.last_event_at = 10.minutes.ago
-      agent.recent_error_logs?.should be_true
+        def @agent.receive_web_request(params, method, format)
+          memory['last_request'] = [params, method, format]
+          ['Ok!', 200]
+        end
+      end
 
-      agent.last_error_log_at = 15.minutes.ago
-      agent.last_event_at = 10.minutes.ago
-      agent.recent_error_logs?.should be_false
+      it "calls the .receive_web_request hook, updates last_web_request_at, and saves" do
+        @agent.trigger_web_request({ :some_param => "some_value" }, "post", "text/html")
+        @agent.reload.memory['last_request'].should == [ { "some_param" => "some_value" }, "post", "text/html" ]
+        @agent.last_web_request_at.to_i.should be_within(1).of(Time.now.to_i)
+      end
+    end
 
-      agent.last_error_log_at = 2.days.ago
-      agent.last_event_at = 10.minutes.ago
-      agent.recent_error_logs?.should be_false
+    context "when .receive_webhook is defined" do
+      before do
+        @agent = Agents::WebRequestReceiver.new(:name => "something")
+        @agent.user = users(:bob)
+        @agent.save!
+
+        def @agent.receive_webhook(params)
+          memory['last_webhook_request'] = params
+          ['Ok!', 200]
+        end
+      end
+
+      it "outputs a deprecation warning and calls .receive_webhook with the params" do
+        mock(Rails.logger).warn("DEPRECATED: The .receive_webhook method is deprecated, please switch your Agent to use .receive_web_request.")
+        @agent.trigger_web_request({ :some_param => "some_value" }, "post", "text/html")
+        @agent.reload.memory['last_webhook_request'].should == { "some_param" => "some_value" }
+        @agent.last_web_request_at.to_i.should be_within(1).of(Time.now.to_i)
+      end
     end
   end
 

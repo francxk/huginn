@@ -28,8 +28,15 @@ describe Utils do
   end
 
   describe "#interpolate_jsonpaths" do
+    let(:payload) { { :there => { :world => "WORLD" }, :works => "should work" } }
+
     it "interpolates jsonpath expressions between matching <>'s" do
-      Utils.interpolate_jsonpaths("hello <$.there.world> this <escape works>", { :there => { :world => "WORLD" }, :works => "should work" }).should == "hello WORLD this should+work"
+      Utils.interpolate_jsonpaths("hello <$.there.world> this <escape works>", payload).should == "hello WORLD this should+work"
+    end
+
+    it "optionally supports treating values that start with '$' as raw JSONPath" do
+      Utils.interpolate_jsonpaths("$.there.world", payload).should == "$.there.world"
+      Utils.interpolate_jsonpaths("$.there.world", payload, :leading_dollarsign_is_jsonpath => true).should == "WORLD"
     end
   end
 
@@ -90,7 +97,7 @@ describe Utils do
     it "escapes </script> tags in the output JSON" do
       cleaned_json = Utils.jsonify(:foo => "bar", :xss => "</script><script>alert('oh no!')</script>")
       cleaned_json.should_not include("</script>")
-      cleaned_json.should include("<\\/script>")
+      cleaned_json.should include('\\u003c/script\\u003e')
     end
 
     it "html_safes the output unless :skip_safe is passed in" do
