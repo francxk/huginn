@@ -16,13 +16,14 @@ describe Agents::TwitterUserAgent do
     }
 
     @checker = Agents::TwitterUserAgent.new(:name => "tectonic", :options => @opts)
+    @checker.service = services(:generic)
     @checker.user = users(:bob)
     @checker.save!
   end
 
   describe "#check" do
     it "should check for changes" do
-      lambda { @checker.check }.should change { Event.count }.by(5)
+      expect { @checker.check }.to change { Event.count }.by(5)
     end
   end
 
@@ -31,10 +32,11 @@ describe Agents::TwitterUserAgent do
       opts = @opts.merge({ :starting_at => "Jan 01 00:00:01 +0000 2999", })
 
       checker = Agents::TwitterUserAgent.new(:name => "tectonic", :options => opts)
+      checker.service = services(:generic)
       checker.user = users(:bob)
       checker.save!
 
-      lambda { checker.check }.should change { Event.count }.by(0)
+      expect { checker.check }.to change { Event.count }.by(0)
     end
   end
 

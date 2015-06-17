@@ -33,9 +33,13 @@ Huginn::Application.configure do
   # Expands the lines which load the assets
   config.assets.debug = true
 
+  # Asset digests allow you to set far-future HTTP expiration dates on all assets,
+  # yet still be able to expire them through the digest params.
+  config.assets.digest = true
+
   config.action_mailer.default_url_options = { :host => ENV['DOMAIN'] }
   config.action_mailer.asset_host = ENV['DOMAIN']
-  config.action_mailer.perform_deliveries = false # Enable when testing!
+  config.action_mailer.perform_deliveries = ENV['SEND_EMAIL_IN_DEVELOPMENT'] == 'true'
   config.action_mailer.raise_delivery_errors = true
   config.action_mailer.delivery_method = :smtp
   # smtp_settings moved to config/initializers/action_mailer.rb

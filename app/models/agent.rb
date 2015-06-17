@@ -1,6 +1,3 @@
-require 'json_serialized_field'
-require 'assignable_types'
-require 'markdown_class_attributes'
 require 'utils'
 
 # Agent is the core class in Huginn, representing a configurable, schedulable, reactive system with memory that can
@@ -14,6 +11,8 @@ class Agent < ActiveRecord::Base
   include WorkingHelpers
   include LiquidInterpolatable
   include HasGuid
+  include LiquidDroppable
+  include DryRunnable
 
   markdown_class_attributes :description, :event_description
 
@@ -24,13 +23,15 @@ class Agent < ActiveRecord::Base
 
   EVENT_RETENTION_SCHEDULES = [["Forever", 0], ["1 day", 1], *([2, 3, 4, 5, 7, 14, 21, 30, 45, 90, 180, 365].map {|n| ["#{n} days", n] })]
 
-  attr_accessible :options, :memory, :name, :type, :schedule, :disabled, :source_ids, :scenario_ids, :keep_events_for, :propagate_immediately
+  attr_accessible :options, :memory, :name, :type, :schedule, :controller_ids, :control_target_ids, :disabled, :source_ids, :scenario_ids, :keep_events_for, :propagate_immediately, :drop_pending_events
 
   json_serialize :options, :memory
 
   validates_presence_of :name, :user
   validates_inclusion_of :keep_events_for, :in => EVENT_RETENTION_SCHEDULES.map(&:last)
   validate :sources_are_owned
+  validate :controllers_are_owned
+  validate :control_targets_are_owned
   validate :scenarios_are_owned
   validate :validate_schedule
   validate :validate_options
@@ -43,21 +44,27 @@ class Agent < ActiveRecord::Base
   after_save :possibly_update_event_expirations
 
   belongs_to :user, :inverse_of => :agents
+  belongs_to :service, :inverse_of => :agents
   has_many :events, -> { order("events.id desc") }, :dependent => :delete_all, :inverse_of => :agent
-  has_one  :most_recent_event, :inverse_of => :agent, :class_name => "Event", :order => "events.id desc"
+  has_one  :most_recent_event, -> { order("events.id desc") }, :inverse_of => :agent, :class_name => "Event"
   has_many :logs,  -> { order("agent_logs.id desc") }, :dependent => :delete_all, :inverse_of => :agent, :class_name => "AgentLog"
   has_many :received_events, -> { order("events.id desc") }, :through => :sources, :class_name => "Event", :source => :events
   has_many :links_as_source, :dependent => :delete_all, :foreign_key => "source_id", :class_name => "Link", :inverse_of => :source
   has_many :links_as_receiver, :dependent => :delete_all, :foreign_key => "receiver_id", :class_name => "Link", :inverse_of => :receiver
   has_many :sources, :through => :links_as_receiver, :class_name => "Agent", :inverse_of => :receivers
   has_many :receivers, :through => :links_as_source, :class_name => "Agent", :inverse_of => :sources
+  has_many :control_links_as_controller, dependent: :delete_all, foreign_key: 'controller_id', class_name: 'ControlLink', inverse_of: :controller
+  has_many :control_links_as_control_target, dependent: :delete_all, foreign_key: 'control_target_id', class_name: 'ControlLink', inverse_of: :control_target
+  has_many :controllers, through: :control_links_as_control_target, class_name: "Agent", inverse_of: :control_targets
+  has_many :control_targets, through: :control_links_as_controller, class_name: "Agent", inverse_of: :controllers
   has_many :scenario_memberships, :dependent => :destroy, :inverse_of => :agent
   has_many :scenarios, :through => :scenario_memberships, :inverse_of => :agents
 
+  scope :active,   -> { where(disabled: false) }
+  scope :inactive, -> { where(disabled: true) }
+
   scope :of_type, lambda { |type|
     type = case type
-             when String, Symbol, Class
-               type.to_s
              when Agent
                type.class.to_s
              else
@@ -65,6 +72,10 @@ class Agent < ActiveRecord::Base
            end
     where(:type => type)
   }
+
+  def short_type
+    type.demodulize
+  end
 
   def check
     # Implement me in your subclass of Agent.
@@ -77,6 +88,10 @@ class Agent < ActiveRecord::Base
 
   def receive(events)
     # Implement me in your subclass of Agent.
+  end
+
+  def is_form_configurable?
+    false
   end
 
   def receive_web_request(params, method, format)
@@ -141,6 +156,14 @@ class Agent < ActiveRecord::Base
     end
   end
 
+  def unavailable?
+    disabled? || dependencies_missing?
+  end
+
+  def dependencies_missing?
+    self.class.dependencies_missing?
+  end
+
   def default_schedule
     self.class.default_schedule
   end
@@ -169,8 +192,15 @@ class Agent < ActiveRecord::Base
     !cannot_create_events?
   end
 
+  def can_control_other_agents?
+    self.class.can_control_other_agents?
+  end
+
+  def can_dry_run?
+    self.class.can_dry_run?
+  end
+
   def log(message, options = {})
-    puts "Agent##{id}: #{message}" unless Rails.env.test?
     AgentLog.log_for_agent(self, message, options)
   end
 
@@ -181,6 +211,14 @@ class Agent < ActiveRecord::Base
   def delete_logs!
     logs.delete_all
     update_column :last_error_log_at, nil
+  end
+
+  def drop_pending_events
+    false
+  end
+
+  def drop_pending_events=(bool)
+    set_last_checked_event_id if bool
   end
 
   # Callbacks
@@ -194,7 +232,7 @@ class Agent < ActiveRecord::Base
   end
 
   def set_last_checked_event_id
-    if newest_event_id = Event.order("id desc").limit(1).pluck(:id).first
+    if can_receive_events? && newest_event_id = Event.maximum(:id)
       self.last_checked_event_id = newest_event_id
     end
   end
@@ -208,11 +246,19 @@ class Agent < ActiveRecord::Base
   private
   
   def sources_are_owned
-    errors.add(:sources, "must be owned by you") unless sources.all? {|s| s.user == user }
+    errors.add(:sources, "must be owned by you") unless sources.all? {|s| s.user_id == user_id }
   end
   
+  def controllers_are_owned
+    errors.add(:controllers, "must be owned by you") unless controllers.all? {|s| s.user_id == user_id }
+  end
+
+  def control_targets_are_owned
+    errors.add(:control_targets, "must be owned by you") unless control_targets.all? {|s| s.user_id == user_id }
+  end
+
   def scenarios_are_owned
-    errors.add(:scenarios, "must be owned by you") unless scenarios.all? {|s| s.user == user }
+    errors.add(:scenarios, "must be owned by you") unless scenarios.all? {|s| s.user_id == user_id }
   end
 
   def validate_schedule
@@ -225,11 +271,25 @@ class Agent < ActiveRecord::Base
     # Implement me in your subclass to test for valid options.
   end
 
+  # Utility Methods
+
+  def boolify(option_value)
+    case option_value
+    when true, 'true'
+      true
+    when false, 'false'
+      false
+    else
+      nil
+    end
+  end
+
   # Class Methods
 
   class << self
     def build_clone(original)
-      new(original.slice(:type, :options, :schedule, :source_ids, :keep_events_for, :propagate_immediately)) { |clone|
+      new(original.slice(:type, :options, :schedule, :controller_ids, :control_target_ids,
+                         :source_ids, :keep_events_for, :propagate_immediately)) { |clone|
         # Give it a unique name
         2.upto(count) do |i|
           name = '%s (%d)' % [original.name, i]
@@ -270,6 +330,27 @@ class Agent < ActiveRecord::Base
       !!@cannot_receive_events
     end
 
+    def can_control_other_agents?
+      include? AgentControllerConcern
+    end
+
+    def can_dry_run!
+      @can_dry_run = true
+    end
+
+    def can_dry_run?
+      !!@can_dry_run
+    end
+
+    def gem_dependency_check
+      @gem_dependencies_checked = true
+      @gem_dependencies_met = yield
+    end
+
+    def dependencies_missing?
+      @gem_dependencies_checked && !@gem_dependencies_met
+    end
+
     # Find all Agents that have received Events since the last execution of this method.  Update those Agents with
     # their new `last_checked_event_id` and queue each of the Agents to be called with #receive using `async_receive`.
     # This is called by bin/schedule.rb periodically.
@@ -307,24 +388,11 @@ class Agent < ActiveRecord::Base
       end
     end
 
-    # Given an Agent id and an array of Event ids, load the Agent, call #receive on it with the Event objects, and then
-    # save it with an updated `last_receive_at` timestamp.
-    #
-    # This method is tagged with `handle_asynchronously` and will be delayed and run with delayed_job.  It accepts Agent
-    # and Event ids instead of a literal ActiveRecord models because it is preferable to serialize delayed_jobs with ids.
+    # This method will enqueue an AgentReceiveJob job. It accepts Agent and Event ids instead of a literal ActiveRecord
+    # models because it is preferable to serialize jobs with ids.
     def async_receive(agent_id, event_ids)
-      agent = Agent.find(agent_id)
-      begin
-        return if agent.disabled?
-        agent.receive(Event.where(:id => event_ids))
-        agent.last_receive_at = Time.now
-        agent.save!
-      rescue => e
-        agent.error "Exception during receive: #{e.message} -- #{e.backtrace}"
-        raise
-      end
+      AgentReceiveJob.perform_later(agent_id, event_ids)
     end
-    handle_asynchronously :async_receive
 
     # Given a schedule name, run `check` via `bulk_check` on all Agents with that schedule.
     # This is called by bin/schedule.rb for each schedule in `SCHEDULES`.
@@ -345,23 +413,35 @@ class Agent < ActiveRecord::Base
       end
     end
 
-    # Given an Agent id, load the Agent, call #check on it, and then save it with an updated `last_check_at` timestamp.
-    #
-    # This method is tagged with `handle_asynchronously` and will be delayed and run with delayed_job.  It accepts an Agent
-    # id instead of a literal Agent because it is preferable to serialize delayed_jobs with ids, instead of with the full
-    # Agents.
+    # This method will enqueue an AgentCheckJob job. It accepts an Agent id instead of a literal Agent because it is
+    # preferable to serialize job with ids, instead of with the full Agents.
     def async_check(agent_id)
-      agent = Agent.find(agent_id)
-      begin
-        return if agent.disabled?
-        agent.check
-        agent.last_check_at = Time.now
-        agent.save!
-      rescue => e
-        agent.error "Exception during check: #{e.message} -- #{e.backtrace}"
-        raise
-      end
+      AgentCheckJob.perform_later(agent_id)
     end
-    handle_asynchronously :async_check
   end
+end
+
+class AgentDrop
+  def type
+    @object.short_type
+  end
+
+  [
+    :name,
+    :type,
+    :options,
+    :memory,
+    :sources,
+    :receivers,
+    :schedule,
+    :controllers,
+    :control_targets,
+    :disabled,
+    :keep_events_for,
+    :propagate_immediately,
+  ].each { |attr|
+    define_method(attr) {
+      @object.__send__(attr)
+    } unless method_defined?(attr)
+  }
 end

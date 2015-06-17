@@ -1,10 +1,8 @@
 # Huginn is designed to be a multi-User system.  Users have many Agents (and Events created by those Agents).
 class User < ActiveRecord::Base
-  # Include default devise modules. Others available are:
-  # :token_authenticatable, :confirmable,
-  # :lockable, :timeoutable and :omniauthable
   devise :database_authenticatable, :registerable,
-         :recoverable, :rememberable, :trackable, :validatable, :lockable
+         :recoverable, :rememberable, :trackable, :validatable, :lockable,
+         :omniauthable
 
   INVITATION_CODES = [ENV['INVITATION_CODE'] || 'try-huginn']
 
@@ -27,6 +25,11 @@ class User < ActiveRecord::Base
   has_many :agents, -> { order("agents.created_at desc") }, :dependent => :destroy, :inverse_of => :user
   has_many :logs, :through => :agents, :class_name => "AgentLog"
   has_many :scenarios, :inverse_of => :user, :dependent => :destroy
+  has_many :services, -> { by_name('asc') }, :dependent => :destroy
+
+  def available_services
+    Service.available_to_user(self).by_name
+  end
 
   # Allow users to login via either email or username.
   def self.find_first_by_auth_conditions(warden_conditions)

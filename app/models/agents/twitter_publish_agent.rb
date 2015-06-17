@@ -1,5 +1,3 @@
-require "twitter"
-
 module Agents
   class TwitterPublishAgent < Agent
     include TwitterConcern
@@ -7,13 +5,10 @@ module Agents
     cannot_be_scheduled!
 
     description <<-MD
+      #{twitter_dependencies_missing if dependencies_missing?}
       The TwitterPublishAgent publishes tweets from the events it receives.
 
-      Twitter credentials must be supplied as either [credentials](/user_credentials) called
-      `twitter_consumer_key`, `twitter_consumer_secret`, `twitter_oauth_token`, and `twitter_oauth_token_secret`,
-      or as options to this Agent called `consumer_key`, `consumer_secret`, `oauth_token`, and `oauth_token_secret`.
-
-      To get oAuth credentials for Twitter, [follow these instructions](https://github.com/cantino/huginn/wiki/Getting-a-twitter-oauth-token).
+      To be able to use this Agent you need to authenticate with Twitter in the [Services](/services) section first.
 
       You must also specify a `message` parameter, you can use [Liquid](https://github.com/cantino/huginn/wiki/Formatting-Events-using-Liquid) to format the message.
 
@@ -41,7 +36,7 @@ module Agents
         incoming_events = incoming_events.first(20)
       end
       incoming_events.each do |event|
-        tweet_text = interpolated(event.payload)['message']
+        tweet_text = interpolated(event)['message']
         begin
           tweet = publish_tweet tweet_text
           create_event :payload => {

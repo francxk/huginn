@@ -28,13 +28,13 @@ module Agents
     event_description <<-MD
     Events look like this:
 
-      {
-        'command' => 'pwd',
-        'path' => '/home/Huginn',
-        'exit_status' => '0',
-        'errors' => '',
-        'output' => '/home/Huginn' 
-      }
+        {
+          "command": "pwd",
+          "path": "/home/Huginn",
+          "exit_status": "0",
+          "errors": "",
+          "output": "/home/Huginn"
+        }
     MD
 
     def default_options
@@ -61,7 +61,7 @@ module Agents
 
     def receive(incoming_events)
       incoming_events.each do |event|
-        handle(interpolated(event.payload), event)
+        handle(interpolated(event), event)
       end
     end
 
